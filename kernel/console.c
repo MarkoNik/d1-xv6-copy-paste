@@ -22,7 +22,10 @@ static int panicked = 0;
 static struct {
 	struct spinlock lock;
 	int locking;
+	int copy;
+	int pos;
 } cons;
+
 
 static void
 printint(int xx, int base, int sign)
@@ -125,18 +128,30 @@ panic(char *s)
 #define BACKSPACE 0x100
 #define CRTPORT 0x3d4
 static ushort *crt = (ushort*)P2V(0xb8000);  // CGA memory
+static char clipboard[64];
+static int len = 0;
 
-static void
-cgaputc(int c)
-{
+
+int getpos() {
 	int pos;
-
-	// Cursor position: col + 80*row.
 	outb(CRTPORT, 14);
 	pos = inb(CRTPORT+1) << 8;
 	outb(CRTPORT, 15);
 	pos |= inb(CRTPORT+1);
+	return pos;
+}
 
+void setpos(int pos) {
+	outb(CRTPORT, 14);
+	outb(CRTPORT+1, pos>>8);
+	outb(CRTPORT, 15);
+	outb(CRTPORT+1, pos);
+}
+
+static void
+cgaputc(int c)
+{
+	int pos = getpos();
 	if(c == '\n')
 		pos += 80 - pos%80;
 	else if(c == BACKSPACE){
@@ -153,10 +168,7 @@ cgaputc(int c)
 		memset(crt+pos, 0, sizeof(crt[0])*(24*80 - pos));
 	}
 
-	outb(CRTPORT, 14);
-	outb(CRTPORT+1, pos>>8);
-	outb(CRTPORT, 15);
-	outb(CRTPORT+1, pos);
+	setpos(pos);
 	crt[pos] = ' ' | 0x0700;
 }
 
@@ -184,15 +196,96 @@ struct {
 	uint e;  // Edit index
 } input;
 
+static inline int
+max(int a, int b) {
+	return a > b ? a : b;
+}
+
+static inline int
+min(int a, int b) {
+	return a < b ? a : b;
+}
+
+void 
+refreshcons(int pos, int selectpos) 
+{
+	if (selectpos == -1) return;
+	for(int i = 0; i < 2000; i++) {
+		crt[i] &= 0x00FF;
+		crt[i] |= 0x0700;
+	}
+	for (int i = min(pos, selectpos); i < max(pos, selectpos); i++) {
+		crt[i] &= 0x00FF;
+		crt[i] |= 0x7000;
+	}
+}
+
 #define C(x)  ((x)-'@')  // Control-x
+#define A(x)  ((x)+128)
 
 void
 consoleintr(int (*getc)(void))
 {
 	int c, doprocdump = 0;
+	static int selectpos = -1;
 
 	acquire(&cons.lock);
 	while((c = getc()) >= 0){
+		if(cons.copy) {
+			int pos = getpos();
+			crt[pos] &= 0x00FF;
+			crt[pos] |= 0x0700;
+			switch(c){
+				case 'w':
+					if (pos >= 80) pos-=80;
+					refreshcons(pos, selectpos);
+					break;
+				case 'a':
+					if (pos >= 1) pos--;
+					refreshcons(pos, selectpos);
+					break;
+				case 's':
+					if (pos < 2000 - 80) pos+=80;
+					refreshcons(pos, selectpos);
+					break;
+				case 'd':
+					if (pos < 2000 - 1) pos++;
+					refreshcons(pos, selectpos);
+					break;
+				case 'q':
+					if (selectpos == -1) {
+						// start copy
+						selectpos = pos;
+					} 
+					break;
+				case 'e':
+					if (selectpos != -1) {
+						// end copy
+						len = 0;
+						for (int i = min(pos, selectpos); i < max(pos, selectpos) && len < 64; i++, len++) {
+							clipboard[len] = crt[i];
+						}
+						if (selectpos < pos && len < 64) clipboard[len++] = (char)crt[pos]; 
+						for (int i = 0; i < 2000; i++) {
+							crt[i] &= 0x00FF;
+							crt[i] |= 0x0700;
+						}
+
+						selectpos = -1;
+					}
+			}
+			setpos(pos);
+			crt[pos] &= 0x00FF;
+			crt[pos] |= 0x7000;
+
+			if (c == A('C') && selectpos == -1) {
+				crt[pos] &= 0x00FF;
+				crt[pos] |= 0x0700;
+				cons.copy^=1;
+				setpos(cons.pos);
+			}
+		}
+		else
 		switch(c){
 		case C('P'):  // Process listing.
 			// procdump() locks cons.lock indirectly; invoke later
@@ -209,6 +302,27 @@ consoleintr(int (*getc)(void))
 			if(input.e != input.w){
 				input.e--;
 				consputc(BACKSPACE);
+			}
+			break;
+		case A('C'):
+			// enter copy mode
+			cons.copy ^= 1;
+			cons.pos = getpos();
+			crt[cons.pos] |= 0x8700;
+			break;
+		case A('P'):
+			if (cons.copy == 0) {
+				// paste
+				for (int i = 0; i < len; i++) {
+					input.buf[input.e++ % INPUT_BUF] = clipboard[i];
+					consputc(clipboard[i]);
+					if(input.e == input.r+INPUT_BUF - 1) {
+						input.w = input.e;
+						//wakeup(&input.r);
+						break;
+					}
+				}
+				len = 0;
 			}
 			break;
 		default:

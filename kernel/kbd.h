@@ -30,6 +30,7 @@
 
 // C('A') == Control-A
 #define C(x) (x - '@')
+#define A(x) (x + 128)
 
 static uchar shiftcode[256] =
 {
